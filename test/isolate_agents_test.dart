@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:isolate';
 
 import 'package:isolate_agents/isolate_agents.dart';
@@ -122,5 +123,75 @@ void main() {
     expect(() async {
       await agent.read();
     }, throwsA(isA<AgentError>()));
+  });
+
+  test('simple stream, returning single value stream', () async {
+    final Agent<int> agent = await Agent.create(() => 0);
+    final stream = agent.getStream(() => Stream<int>.value(31));
+    expect(await stream.first, 31);
+  });
+
+  test('simple stream, returning a list of values, different type <E> than Agent<T>', () async {
+    final Agent<int> agent = await Agent.create(() => 0);
+    final listVals = ["alice", "bob"];
+    final stream = agent.getStream(() => Stream<String>.fromIterable(listVals));
+    var err = await agent.error;
+    expect(err, isNull);
+    var result = await stream.toList();
+    expect(result, listVals);
+  });
+
+  test('complex stream, delays between values returned', () async {
+    final Agent<int> agent = await Agent.create(() => 0);
+    final stream = agent.getStream(() => Stream<int>.periodic(Duration(milliseconds: 5), (int x) => x));
+    expect(await stream.take(10).toList(), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  });
+
+  test('complex stream, measure delay between values to ensure live feed, not all batched', () async {
+    final Agent<int> agent = await Agent.create(() => 0);
+    final delay = Duration(milliseconds: 100);
+    final fudgeFactor = delay * 0.90;  // sometimes a periodic() event arrives slightly early, give 10% slack
+    final stream = agent.getStream(() => Stream<int>.periodic(delay, (x) => x));
+    var watch = Stopwatch()..start();
+    await for (var _ in stream.takeWhile((x) => x < 5)) {
+      expect(watch.elapsedMilliseconds, greaterThanOrEqualTo(delay.inMilliseconds - fudgeFactor.inMilliseconds));
+      // print("Elapsed: ${watch.elapsedMilliseconds} msec");
+      watch..reset()..start();
+    }
+  });
+
+  test('stream yields several values then throws an exception, propagated to client', () async {
+    final Agent<int> agent = await Agent.create(() => 0);
+    final stream = agent.getStream(() async* {
+      for (int i = 0; i <= 10; i++) {
+        if (i >= 5) {
+          throw 'Interrupted at $i';
+        }
+        yield i;
+      }
+    });
+    final result = await stream.toList();
+    expect(result, [0, 1, 2, 3, 4]);
+    var err = await agent.error;
+    expect(err!.error, 'Interrupted at 5');
+  });
+
+  test('interleave consuming two async streams from actor, walking two Stream iterables concurrently', () async {
+    final Agent<int> agent = await Agent.create(() => 0);
+    final numList = [1, 2, 3, 7];
+    final stringList = ["alice", "bob", "charlie", "zaphod"];
+    final realStream1 = agent.getStream(() => Stream<int>.fromIterable(numList));
+    final realStream2 = agent.getStream(() => Stream<String>.fromIterable(stringList));
+    final stream1 = StreamIterator(realStream1);
+    final stream2 = StreamIterator(realStream2);
+    // awkwardly walks both streams at once, one element at a time, testing each
+    for (var idx = 0; idx < numList.length; idx++) {
+      await Future.wait([stream1.moveNext(), stream2.moveNext()]);
+      var number = stream1.current;
+      var name = stream2.current;
+      expect(number, numList[idx]);
+      expect(name, stringList[idx]);
+    }
+    expect(await agent.error, isNull);
   });
 }

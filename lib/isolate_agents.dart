@@ -19,6 +19,7 @@ class _Result<T> {
 enum _Commands {
   init,
   exec,
+  execStream,
   exit,
   query,
   getError,
@@ -31,47 +32,62 @@ class AgentError {
   final StackTrace stackTrace;
 }
 
-void _isolateMain<T>(SendPort sendPort) {
+void _isolateMain<T>(SendPort sendPort) async {
   ReceivePort receivePort = ReceivePort();
   sendPort.send(receivePort.sendPort);
   late T state;
   AgentError? error;
-  receivePort.listen((value) {
+  receivePort.listen((value) async {
     _Command command = value;
-    if (command.code == _Commands.init) {
-      try {
-        state = (command.arg0 as T Function())();
-      } catch (e, stackTrace) {
-        error = AgentError(e, stackTrace);
-      }
-    } else if (command.code == _Commands.exec) {
-      try {
-        final func = command.arg0 as T Function(T);
-        state = func(state);
-      } catch (e, stackTrace) {
-        error = AgentError(e, stackTrace);
-      }
-      command.sendPort!.send(null);
-    } else if (command.code == _Commands.exit) {
-      Isolate.exit(command.sendPort!, state);
-    } else if (command.code == _Commands.query) {
-      Object? result;
-      try {
-        Object? Function(T) func = command.arg0 as Object? Function(T);
-        result = func(state);
-      } catch (e, stackTrace) {
-        error = AgentError(e, stackTrace);
-      }
-      if (error != null) {
-        command.sendPort!.send(_Result<dynamic>(value: null, error: error));
-      } else {
-        command.sendPort!.send(_Result<dynamic>(value: result, error: null));
-      }
-    } else if (command.code == _Commands.getError) {
-      command.sendPort!.send(error);
-    } else if (command.code == _Commands.resetError) {
-      error = null;
-      command.sendPort!.send(null);
+    switch (command.code) {
+      case _Commands.init:
+        try {
+          state = (command.arg0 as T Function())();
+        } catch (e, stackTrace) {
+          error = AgentError(e, stackTrace);
+        }
+        return;
+      case _Commands.exec:
+        try {
+          final func = command.arg0 as T Function(T);
+          state = func(state);
+        } catch (e, stackTrace) {
+          error = AgentError(e, stackTrace);
+        }
+        command.sendPort!.send(null);
+        return;
+      case _Commands.execStream:
+        try {
+          final func = command.arg0 as Stream<dynamic> Function();
+          Stream<dynamic> stream = func();
+          await for (final result in stream) {
+            command.sendPort!.send(_Result<dynamic>(value: result, error: error));
+          }
+        } catch (e, stackTrace) {
+          error = AgentError(e, stackTrace);
+        }
+        command.sendPort!.send(null); // sentinel null sent as final value indicating end of stream
+        return;
+      case _Commands.query:
+        Object? result;
+        try {
+          Object? Function(T) func = command.arg0 as Object? Function(T);
+          result = func(state);
+          // error = null;  // past errors are re-sent until resetError command is sent
+        } catch (e, stackTrace) {
+          error = AgentError(e, stackTrace);
+        }
+        command.sendPort!.send(_Result<dynamic>(value: result, error: error));
+        return;
+      case _Commands.resetError:
+        error = null;
+        command.sendPort!.send(null);
+        return;
+      case _Commands.getError:
+        command.sendPort!.send(error);
+        return;
+      case _Commands.exit:
+        Isolate.exit(command.sendPort!, state);
     }
   });
 }
@@ -107,6 +123,26 @@ class Agent<T> {
     _sendPort.send(
         _Command(_Commands.exec, sendPort: receivePort.sendPort, arg0: func));
     return receivePort.first;
+  }
+
+  /// Send a closure [func] generating a Stream<T>, that will be iterated within the [Agent]'s [Isolate]
+  /// and the resulting [Stream]<T> will iterate asynchronously for values streamed back to the caller.
+  Stream<E> getStream<E>(Stream<E> Function() func) async* {
+    if (_isolate == null) {
+      throw StateError('Agent has been killed.');
+    }
+    ReceivePort receivePort = ReceivePort();
+    _sendPort.send(
+        _Command(_Commands.execStream, sendPort: receivePort.sendPort, arg0: func));
+    await for (final result in receivePort) {
+      if (result == null) {
+        return;
+      }
+      if (result.error != null) {
+        throw result.error!;
+      }
+      yield result.value as E;
+    }
   }
 
   /// Reads the [Agent]'s state with a closure.
